@@ -5484,6 +5484,41 @@ def _b12x_gemm_fp4_requirement(
     return True
 
 
+@supported_compute_capability([100, 103, 120, 121])
+def _cutile_gemm_fp4_requirement(
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,  # unused
+    b_descale: torch.Tensor,  # unused
+    alpha: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,  # unused
+    block_size: int = 16,
+    use_8x4_sf_layout: bool = False,
+    backend: Literal[
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "cutile", "auto"
+    ] = "auto",  # unused
+    use_nvfp4: bool = True,
+    enable_pdl: bool = True,  # unused
+):
+    # cuTile mm_fp4 currently supports NVFP4 only (block_size=16, 2D scales).
+    # 8x4 SF layout, MXFP4 (block_size=32), and mxfp4 quantization are
+    # follow-up work.
+    if use_8x4_sf_layout:
+        raise ValueError("cuTile FP4 GEMM only supports 128x4 scale factor layout.")
+    if not use_nvfp4:
+        raise ValueError("cuTile FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
+    if block_size != 16:
+        raise ValueError(
+            f"cuTile FP4 GEMM requires block_size=16 (NVFP4); got {block_size}."
+        )
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"cuTile FP4 GEMM requires out_dtype in (bfloat16, float16); got {out_dtype}."
+        )
+    return True
+
+
 # Module-level kernel cache for CuTe DSL GEMM, shared across runner instances.
 # Keyed by (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
 #            kernel_type, use_tma_store, enable_pdl, out_dtype).
@@ -6136,6 +6171,7 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
         "cutlass": _cutlass_gemm_fp4_requirement,
         "cute-dsl": _cute_dsl_gemm_fp4_requirement,
         "b12x": _b12x_gemm_fp4_requirement,
+        "cutile": _cutile_gemm_fp4_requirement,
     },
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
@@ -6151,7 +6187,9 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
+    backend: Literal[
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "cutile", "auto"
+    ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -6237,6 +6275,21 @@ def mm_fp4(
             (a.shape[0], b.shape[1]),
             device=a.device,
             dtype=out_dtype,
+        )
+
+    # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
+    # Handled before the AutoTuner path because it does not consume
+    # `workspace_buffer` and does not participate in the runner factory.
+    if backend == "cutile":
+        from ..cutile.fp4_gemm import mm_fp4_cutile
+        return mm_fp4_cutile(
+            a=a,
+            b=b,
+            a_descale=a_descale,
+            b_descale=b_descale,
+            alpha=alpha,
+            out=out,
+            block_size=block_size,
         )
 
     workspace_buffer = _get_cache_buf(
