@@ -60,9 +60,10 @@ def test_mm_bf16(
         pytest.skip(
             "mm_bf16 with cuBLASLt backend does not support bias or pdl arguments."
         )
-    if backend == "cutile" and (enable_bias or pdl):
+    if backend == "cutile" and pdl:
         pytest.skip(
-            "mm_bf16 with cuTile backend does not support bias or pdl arguments."
+            "mm_bf16 with cuTile backend does not support the pdl argument "
+            "(cuTile runtime does not expose programmatic dependent launch yet)."
         )
     if res_dtype != torch.bfloat16 and backend == "tgv":
         pytest.skip(
@@ -99,12 +100,13 @@ def test_mm_bf16(
     assert cos_sim > 0.99
 
 
-def test_mm_bf16_cutile_rejects_bias_and_pdl():
-    """The v1 cuTile path is alpha=1/beta=0 and ignores bias / pdl — must raise.
+def test_mm_bf16_cutile_rejects_pdl():
+    """The cuTile path supports out_dtype ∈ {bf16, fp16, fp32} and bias, but
+    still rejects ``pdl`` because the cuda.tile runtime does not expose
+    programmatic-dependent-launch attributes yet.
 
-    Output dtype, on the other hand, supports bf16 / fp16 / fp32 via the
-    polymorphic store epilogue, so it is exercised in the main parametrized
-    matrix above rather than rejected here.
+    bias is now exercised in the main parametrized matrix above (no skip),
+    using the alpha=1, beta=1 path with bias pre-broadcast into ``out``.
     """
     compute_capability = get_compute_capability(torch.device("cuda"))
     cc_num = compute_capability[0] * 10 + compute_capability[1]
@@ -115,13 +117,9 @@ def test_mm_bf16_cutile_rejects_bias_and_pdl():
     except ImportError:
         pytest.skip("cuda-tile not installed in this environment.")
 
-    # a is (m, k) = (64, 1024); b is (n, k) = (2048, 1024); b.T is (k, n) = (1024, 2048)
     a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
     out = torch.empty(64, 2048, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="ignores `bias`"):
-        mm_bf16(a, b.T, bias, False, out, torch.bfloat16, backend="cutile")
     with pytest.raises(ValueError, match="ignores `pdl`"):
         mm_bf16(a, b.T, None, True, out, torch.bfloat16, backend="cutile")
 

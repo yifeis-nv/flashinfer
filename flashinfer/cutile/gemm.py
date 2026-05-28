@@ -595,12 +595,13 @@ def mm_bf16_cutile(
     a: torch.Tensor,
     b: torch.Tensor,
     out: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
     use_autotune: bool = True,
     num_sms: Optional[int] = None,
 ) -> torch.Tensor:
     """BF16 GEMM via cuTile, matching the `flashinfer.mm_bf16` layout.
 
-    Equivalent computation: ``out = a @ b``.
+    Equivalent computation: ``out = a @ b + bias`` (bias broadcast across M).
 
     Layout
     ------
@@ -609,32 +610,55 @@ def mm_bf16_cutile(
         b : a transposed view of a (N, K) row-major tensor — shape (K, N), bf16,
             *not* contiguous (strides are (1, K))
         out : shape (M, N), out_dtype, row-major (contiguous)
+        bias : optional (N,) bf16 — broadcast-added in epilogue.
+
+    Bias handling
+    -------------
+    The underlying alpha-beta kernel computes ``result = alpha * acc + beta *
+    c_load`` in fp32 in the epilogue. We use ``alpha=1, beta=0`` (no bias) or
+    ``alpha=1, beta=1`` with bias pre-broadcast into ``out`` so the kernel's
+    own ``c_load`` term picks it up — *no kernel change required*.
 
     The cuTile kernel's native fast path expects ``b_native`` to be a (N, K)
     row-major contiguous tensor with ``trans_b=True``. We recover that view
     cheaply via ``b.transpose(-2, -1)`` (zero-copy on the storage layer that
     `mm_bf16` itself produced).
     """
-    # NaN-poisoning guard: the underlying alpha-beta GEMM kernel computes
-    #   result = alpha * acc + beta * c_load_f32
-    # Even with ``beta == 0.0``, IEEE 754 specifies ``0 * NaN == NaN`` (and
-    # likewise ``0 * Inf == NaN``), so any NaN already sitting in the storage
-    # backing ``out`` poisons every output element.
-    #
-    # ``mm_bf16`` callers typically allocate ``out`` via ``torch.empty(...)``,
-    # which leaves the buffer uninitialized. CUDA's caching allocator may
-    # return memory whose previous occupant left NaN bits — which then leak
-    # through the beta=0 epilogue path and produce all-NaN output non-
-    # deterministically (depending on allocator state).
-    #
-    # Zeroing ``out`` here costs ~one fused memset; on B200 BF16 GEMM shapes
-    # this is well under 1% of total kernel time. The proper long-term fix is
-    # a beta=0 specialization that skips the c_load entirely (follow-up).
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
         raise ValueError(
             f"mm_bf16_cutile requires bf16 a and b; got a.dtype={a.dtype}, b.dtype={b.dtype}"
         )
-    out.zero_()
+
+    if bias is None:
+        # NaN-poisoning guard: the underlying alpha-beta GEMM kernel computes
+        # ``result = alpha * acc + beta * c_load_f32``. Even with ``beta ==
+        # 0.0``, IEEE 754 specifies ``0 * NaN == NaN`` (and ``0 * Inf == NaN``),
+        # so any NaN already sitting in the storage backing ``out`` poisons
+        # every output element. Callers typically allocate ``out`` via
+        # ``torch.empty(...)`` which leaves the buffer uninitialized. CUDA's
+        # caching allocator may hand back memory whose previous occupant left
+        # NaN bits — which then leak through the beta=0 epilogue path.
+        out.zero_()
+        beta_val = 0.0
+    else:
+        # Bias path: broadcast bias into ``out`` and set beta=1 so the kernel's
+        # ``c_load`` term contributes ``1 * bias_broadcast``. This costs one
+        # extra copy (out.copy_) but reuses the existing alpha-beta kernel
+        # without modification — kernel signature and autotune config space
+        # are unchanged.
+        if bias.dim() != 1 or bias.shape[0] != out.shape[1]:
+            raise ValueError(
+                f"mm_bf16_cutile bias must be 1-D of length N={out.shape[1]}; "
+                f"got shape {tuple(bias.shape)}"
+            )
+        if bias.dtype != torch.bfloat16:
+            raise ValueError(
+                f"mm_bf16_cutile bias must be bf16; got {bias.dtype}"
+            )
+        # bias.unsqueeze(0).expand_as(out) is a zero-copy broadcast view; the
+        # ``.copy_`` materializes it as a contiguous (M, N) write into ``out``.
+        out.copy_(bias.unsqueeze(0).expand_as(out))
+        beta_val = 1.0
 
     # Recover (N, K) row-major contiguous view that the kernel expects.
     # The upstream caller produces b as `(N, K).transpose(-2, -1)`, so undoing
@@ -651,7 +675,7 @@ def mm_bf16_cutile(
         trans_a=False,
         trans_b=True,
         alpha=1.0,
-        beta=0.0,
+        beta=beta_val,
         num_sms=num_sms,
         use_autotune=use_autotune,
     )

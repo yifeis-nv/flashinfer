@@ -374,9 +374,10 @@ def _cutile_mm_bf16_requirement(
             "The cuTile backend supports bfloat16 / float16 / float32 output only; "
             f"got {out_dtype}."
         )
-    if bias is not None:
+    if bias is not None and bias.dtype != torch.bfloat16:
         raise ValueError(
-            "The cuTile backend ignores `bias`; pass bias=None or use the TGV / cuDNN backend."
+            "The cuTile backend requires bf16 bias when bias is provided; "
+            f"got {bias.dtype}."
         )
     if pdl:
         raise ValueError(
@@ -607,9 +608,11 @@ def mm_bf16(
     # `workspace_buffer` and ignores `bias` / `pdl`.
     if backend == "cutile":
         from ..cutile.gemm import mm_bf16_cutile
-        # out_dtype validation already handled by ``_cutile_mm_bf16_requirement``
-        # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
-        return mm_bf16_cutile(a, b, out)
+        # out_dtype + bias validation handled by ``_cutile_mm_bf16_requirement``
+        # via the ``@backend_requirement`` decorator (accepts bf16/fp16/fp32 out
+        # and bf16 bias; pdl still rejected). The cuTile wrapper materializes
+        # bias into ``out`` and switches the alpha-beta kernel to beta=1.0.
+        return mm_bf16_cutile(a, b, out, bias=bias)
 
     workspace_buffer = _get_cache_buf(
         "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
@@ -6785,6 +6788,7 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile", "auto"] = "auto",
 ):
     if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(f"a must be a float8 tensor, but got {a.dtype}")
@@ -6842,8 +6846,40 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
     return True
 
 
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutile_group_gemm_fp8_nt_groupwise_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    scale_major_mode: Literal["MN", "K"] = "MN",
+    mma_sm: int = 1,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile", "auto"] = "auto",
+):
+    # cuTile v1 only supports K-major scales and (1, 128, 128) granularity —
+    # same constraints as ``gemm_fp8_nt_groupwise`` cuTile.
+    if scale_major_mode != "K":
+        raise ValueError(
+            f"The cuTile backend currently supports scale_major_mode='K' only; "
+            f"got {scale_major_mode!r}."
+        )
+    m_g, n_g, k_g = scale_granularity_mnk
+    if m_g != 1 or (n_g, k_g) != (128, 128):
+        raise ValueError(
+            f"The cuTile backend currently supports scale_granularity_mnk=(1, 128, 128) only; "
+            f"got {scale_granularity_mnk}."
+        )
+    return True
+
+
 @backend_requirement(
-    {},
+    {
+        "cutile": _cutile_group_gemm_fp8_nt_groupwise_requirement,
+    },
     common_check=_check_group_gemm_fp8_nt_groupwise_problem_size,
 )
 @flashinfer_api
@@ -6858,6 +6894,7 @@ def group_gemm_fp8_nt_groupwise(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""Perform group GEMM with FP8 data types using groupwise scaling. Currently only supported on NVIDIA
     Blackwell architecture.
@@ -6931,6 +6968,23 @@ def group_gemm_fp8_nt_groupwise(
     out_shape = (a.shape[0], n)
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
+
+    if backend == "cutile":
+        # cuTile path: a pure ``cuda.tile`` Python implementation that iterates
+        # over groups and reuses ``gemm_fp8_nt_groupwise_cutile`` per group.
+        # Constraints (scale_major_mode='K', granularity=(1,128,128)) already
+        # validated by ``_cutile_group_gemm_fp8_nt_groupwise_requirement``.
+        from ..cutile.fp8_gemm import group_gemm_fp8_nt_groupwise_cutile
+        return group_gemm_fp8_nt_groupwise_cutile(
+            a=a,
+            b=b,
+            a_scale=a_scale,
+            b_scale=b_scale,
+            m_indptr=m_indptr,
+            out=out,
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode,
+        )
 
     if is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter

@@ -417,6 +417,70 @@ def test_gemm_fp8_nt_groupwise_cutile_out_dtypes(m, n, k, out_dtype):
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("m", [128, 256])
+@pytest.mark.parametrize("n", [256, 2048])
+@pytest.mark.parametrize("k", [256, 2048])
+@pytest.mark.parametrize("group_size", [1, 4, 8])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_group_gemm_fp8_nt_groupwise_cutile(m, n, k, group_size, out_dtype):
+    """cuTile group_gemm_fp8_nt_groupwise — K-major scales, per-group iteration.
+
+    The cuTile group path loops over groups and reuses
+    ``gemm_fp8_nt_groupwise_cutile`` per group, so this exercises both
+    correctness across multiple groups and the wrapper's per-group slicing.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10, 11, 12]:
+        pytest.skip("cuTile group_gemm fp8 backend requires SM100+ GPUs.")
+    try:
+        import cuda.tile  # noqa: F401
+    except ImportError:
+        pytest.skip("cuda-tile not installed in this environment.")
+
+    torch.random.manual_seed(0)
+    tile_size = 128
+    scale_major_mode = "K"
+
+    a_val = torch.randn((group_size * m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn(
+        (group_size, n, k), dtype=torch.float, device="cuda"
+    ) / math.sqrt(k)
+
+    a_scale_shape = (group_size * m, k // tile_size)
+    b_scale_shape = (group_size, n // tile_size, k // tile_size)
+    a_tile_shape = (1, tile_size)
+    b_tile_shape = (1, tile_size, tile_size)
+
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
+
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+
+    m_indptr = torch.arange(0, group_size + 1, dtype=torch.int32, device="cuda") * m
+
+    out = group_gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        m_indptr,
+        scale_major_mode=scale_major_mode,
+        out_dtype=out_dtype,
+        backend="cutile",
+    )
+    ref_c = (
+        einsum(
+            a_dequant.view((group_size, m, k)),
+            b_dequant,
+            "b m k, b n k -> b m n",
+        )
+        .view((group_size * m, n))
+        .to(out_dtype)
+    )
+    torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
+
+
 def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
     """The v1 cuTile fp8 path only supports K-major scales; MN-major must raise."""
     compute_capability = get_compute_capability(torch.device("cuda"))
