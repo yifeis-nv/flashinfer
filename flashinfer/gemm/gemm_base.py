@@ -377,9 +377,19 @@ def _cutile_mm_bf16_requirement(
             f"got {out_dtype}."
         )
     if bias is not None:
-        raise ValueError(
-            "The cuTile backend ignores `bias`; pass bias=None or use the TGV / cuDNN backend."
-        )
+        # cuTile mm_bf16 supports a 1-D per-output-feature bias by pre-broadcasting
+        # the bias into `out` and running the GEMM with beta=1.0. Only bf16 bias
+        # is supported, matching the output dtype of the kernel.
+        if bias.dim() != 1:
+            raise ValueError(
+                "The cuTile backend requires a 1-D per-output-feature bias; "
+                f"got bias with {bias.dim()} dims."
+            )
+        if bias.dtype != torch.bfloat16:
+            raise ValueError(
+                "The cuTile backend only supports bfloat16 bias; "
+                f"got bias dtype {bias.dtype}."
+            )
     if pdl:
         raise ValueError(
             "The cuTile backend ignores `pdl`; pass pdl=False or use the TGV / cuDNN backend."
@@ -606,13 +616,15 @@ def mm_bf16(
 
     # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
     # Handled before the SM100 dispatch table because it does not consume
-    # `workspace_buffer` and ignores `bias` / `pdl`.
+    # `workspace_buffer` and ignores `pdl`. `bias` (1-D bf16) is supported via
+    # pre-broadcast into `out` + GEMM with beta=1.0; validated by
+    # ``_cutile_mm_bf16_requirement``.
     if backend == "cutile":
         from .kernels.cutile.mm_bf16_cutile import mm_bf16_cutile
 
-        # out_dtype validation already handled by ``_cutile_mm_bf16_requirement``
-        # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
-        return mm_bf16_cutile(a, b, out)
+        # out_dtype + bias validation already handled by ``_cutile_mm_bf16_requirement``
+        # via the ``@backend_requirement`` decorator.
+        return mm_bf16_cutile(a, b, out, bias=bias)
 
     workspace_buffer = _get_cache_buf(
         "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
@@ -6354,11 +6366,12 @@ def _cutile_gemm_fp8_nt_groupwise_requirement(
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
 ):
-    # v1 supports only K-major scales + (1, 128, 128) granularity.
-    # MN-major and other granularities are documented follow-ups.
-    if scale_major_mode not in (None, "K"):
+    # Both scale_major_mode='K' and 'MN' are supported via wrapper-level scale
+    # transpose (the kernel itself is K-major and uses arbitrary strides so a
+    # non-contiguous transpose view is consumed without any kernel change).
+    if scale_major_mode not in (None, "K", "MN"):
         raise ValueError(
-            f"The cuTile backend currently supports scale_major_mode='K' only; "
+            f"The cuTile backend supports scale_major_mode in ('K', 'MN'); "
             f"got {scale_major_mode!r}."
         )
     m_g, n_g, k_g = scale_granularity_mnk
@@ -6783,6 +6796,57 @@ def gemm_fp8_nt_blockscaled(
 
 
 @supported_compute_capability([100, 103, 120, 121])
+def _cutlass_group_gemm_fp8_nt_groupwise_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    scale_major_mode: Literal["MN", "K"] = "MN",
+    mma_sm: int = 1,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile", "cutlass"] = "cutlass",
+):
+    # The cutlass path is the original (pre-cuTile) implementation; the actual
+    # constraint validation lives in ``_check_group_gemm_fp8_nt_groupwise_problem_size``
+    # (the common_check). This entry is needed only so the @backend_requirement
+    # decorator accepts backend='cutlass' without raising BackendSupportedError.
+    return True
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutile_group_gemm_fp8_nt_groupwise_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    scale_major_mode: Literal["MN", "K"] = "MN",
+    mma_sm: int = 1,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile", "cutlass"] = "cutlass",
+):
+    # Both scale_major_mode='K' and 'MN' are supported via wrapper-level scale
+    # transpose, matching the single-GEMM cuTile path.
+    if scale_major_mode not in (None, "K", "MN"):
+        raise ValueError(
+            f"The cuTile backend supports scale_major_mode in ('K', 'MN'); "
+            f"got {scale_major_mode!r}."
+        )
+    m_g, n_g, k_g = scale_granularity_mnk
+    if m_g != 1 or (n_g, k_g) != (128, 128):
+        raise ValueError(
+            f"The cuTile backend currently supports scale_granularity_mnk=(1, 128, 128) only; "
+            f"got {scale_granularity_mnk}."
+        )
+    return True
+
+
+@supported_compute_capability([100, 103, 120, 121])
 def _check_group_gemm_fp8_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -6794,6 +6858,7 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile", "cutlass"] = "cutlass",
 ):
     if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(f"a must be a float8 tensor, but got {a.dtype}")
@@ -6852,7 +6917,10 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
 
 
 @backend_requirement(
-    {},
+    {
+        "cutlass": _cutlass_group_gemm_fp8_nt_groupwise_requirement,
+        "cutile": _cutile_group_gemm_fp8_nt_groupwise_requirement,
+    },
     common_check=_check_group_gemm_fp8_nt_groupwise_problem_size,
 )
 @flashinfer_api
@@ -6867,6 +6935,7 @@ def group_gemm_fp8_nt_groupwise(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile", "cutlass"] = "cutlass",
 ) -> torch.Tensor:
     r"""Perform group GEMM with FP8 data types using groupwise scaling. Currently only supported on NVIDIA
     Blackwell architecture.

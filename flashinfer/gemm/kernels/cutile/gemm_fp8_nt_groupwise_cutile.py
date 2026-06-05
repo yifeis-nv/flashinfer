@@ -379,21 +379,21 @@ def gemm_fp8_nt_groupwise_cutile(
     scale_granularity_mnk : (m_g, n_g, k_g). The kernel currently supports
         ``m_g == 1`` (per-token-group on M); ``n_g`` becomes ``block_n`` and
         ``k_g`` becomes ``block_k``.
-    scale_major_mode : currently only ``"K"`` is supported. The cuTile
-        kernel reads ``As[m, k_group]`` and ``Bs[n_group, k_group]`` in that
-        layout. ``"MN"`` mode would require an additional transpose adapter
-        on the scales — left as a follow-up if the cutlass/trtllm paths
-        actually exercise it.
+    scale_major_mode : ``"K"`` or ``"MN"``. The underlying cuTile kernel is
+        K-major and reads ``As[m, k_group]`` and ``Bs[n_group, k_group]`` in
+        that layout. When ``"MN"`` is passed the wrapper transposes the
+        incoming scale views — the kernel uses arbitrary strides via its
+        ``STRIDE__AS_*`` / ``STRIDE__BS_*`` constants so the non-contiguous
+        view is consumed without any kernel modification.
 
     Returns
     -------
     The same ``out`` tensor (modified in place).
     """
-    if scale_major_mode != "K":
+    if scale_major_mode not in ("K", "MN"):
         raise NotImplementedError(
-            f"cuTile gemm_fp8_nt_groupwise only supports scale_major_mode='K' "
-            f"in v1; got {scale_major_mode!r}. MN-major scale support is a "
-            f"follow-up."
+            f"cuTile gemm_fp8_nt_groupwise supports scale_major_mode in "
+            f"('K', 'MN'); got {scale_major_mode!r}."
         )
 
     m_g, n_g, k_g = scale_granularity_mnk
@@ -431,16 +431,38 @@ def gemm_fp8_nt_groupwise_cutile(
         raise ValueError("out must be contiguous")
     if not (a_scale.dim() == 2 and b_scale.dim() == 2):
         raise ValueError("scales must be 2D")
-    # a_scale shape: (M, K // block_k); b_scale shape: (N // block_n, K // block_k)
-    if a_scale.shape != (M, _cdiv(K, block_k)):
-        raise ValueError(
-            f"a_scale must be ({M}, {_cdiv(K, block_k)}); got {tuple(a_scale.shape)}"
-        )
-    if b_scale.shape != (_cdiv(N, block_n), _cdiv(K, block_k)):
-        raise ValueError(
-            f"b_scale must be ({_cdiv(N, block_n)}, {_cdiv(K, block_k)}); "
-            f"got {tuple(b_scale.shape)}"
-        )
+    # Scale shapes:
+    #   K-major:  a_scale (M, K//block_k),         b_scale (N//block_n, K//block_k)
+    #   MN-major: a_scale (K//block_k, M),         b_scale (K//block_k, N//block_n)
+    # The cuTile kernel itself is K-major. We transpose the MN-major views
+    # before passing them into the kernel — the kernel respects arbitrary
+    # strides via its STRIDE__AS_*/STRIDE__BS_* constants.
+    if scale_major_mode == "K":
+        if a_scale.shape != (M, _cdiv(K, block_k)):
+            raise ValueError(
+                f"a_scale must be ({M}, {_cdiv(K, block_k)}); got {tuple(a_scale.shape)}"
+            )
+        if b_scale.shape != (_cdiv(N, block_n), _cdiv(K, block_k)):
+            raise ValueError(
+                f"b_scale must be ({_cdiv(N, block_n)}, {_cdiv(K, block_k)}); "
+                f"got {tuple(b_scale.shape)}"
+            )
+        a_scale_k = a_scale
+        b_scale_k = b_scale
+    else:  # MN-major
+        if a_scale.shape != (_cdiv(K, block_k), M):
+            raise ValueError(
+                f"a_scale must be ({_cdiv(K, block_k)}, {M}); got {tuple(a_scale.shape)}"
+            )
+        if b_scale.shape != (_cdiv(K, block_k), _cdiv(N, block_n)):
+            raise ValueError(
+                f"b_scale must be ({_cdiv(K, block_k)}, {_cdiv(N, block_n)}); "
+                f"got {tuple(b_scale.shape)}"
+            )
+        # transpose() returns a stride-only view; no copy. The kernel reads
+        # via STRIDE__AS_M / STRIDE__AS_K so non-contiguous strides are fine.
+        a_scale_k = a_scale.transpose(0, 1)
+        b_scale_k = b_scale.transpose(0, 1)
 
     out_dtype_int = _DTYPE_INT_MAP.get(out.dtype)
     if out_dtype_int is None:
@@ -456,8 +478,8 @@ def gemm_fp8_nt_groupwise_cutile(
         a,
         b,
         out,
-        a_scale,
-        b_scale,
+        a_scale_k,
+        b_scale_k,
         M,
         N,
         K,
@@ -465,4 +487,116 @@ def gemm_fp8_nt_groupwise_cutile(
         block_k,
         out_dtype_int,
     )
+    return out
+
+
+def group_gemm_fp8_nt_groupwise_cutile(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    out: torch.Tensor,
+    scale_granularity_mnk: tuple = (1, 128, 128),
+    scale_major_mode: str = "K",
+) -> torch.Tensor:
+    """Grouped FP8 block-scaled GEMM via cuTile.
+
+    Computes a stacked sequence of FP8 GEMMs sharing the same K / N but with
+    per-group M slices, where the per-group inputs are concatenated along the
+    M axis. Used heavily in MoE workloads where each expert is a different
+    group.
+
+    The v1 implementation iterates over groups and calls
+    ``gemm_fp8_nt_groupwise_cutile`` once per group. This launches one kernel
+    per non-empty group — fine as a correctness baseline. A fused-launch
+    optimization (single autotuned kernel that consumes ``m_indptr`` directly,
+    mirroring the way the ragged BMM kernel does it) is a follow-up.
+
+    Parameters
+    ----------
+    a : (cum_m, K) FP8 e4m3 / e5m2, row-major, contiguous.
+    b : (num_groups, N, K) FP8 e4m3 / e5m2, row-major.
+    a_scale :
+        K-major: (cum_m, K // block_k) per-token-group scale.
+        MN-major: (K // block_k, cum_m).
+    b_scale :
+        K-major: (num_groups, N // block_n, K // block_k) per-block scale.
+        MN-major: (num_groups, K // block_k, N // block_n).
+    m_indptr : (num_groups + 1,) int32 cumulative segment starts.
+    out : (cum_m, N) bf16 / fp16 / fp32, contiguous (modified in place).
+    scale_granularity_mnk : (m_g, n_g, k_g); m_g must be 1.
+    scale_major_mode : ``"K"`` or ``"MN"``.
+
+    Returns
+    -------
+    The same ``out`` tensor (modified in place).
+    """
+    if scale_major_mode not in ("K", "MN"):
+        raise NotImplementedError(
+            f"cuTile group_gemm_fp8_nt_groupwise supports scale_major_mode in "
+            f"('K', 'MN'); got {scale_major_mode!r}."
+        )
+    m_g, n_g, k_g = scale_granularity_mnk
+    if m_g != 1 or (n_g, k_g) != (128, 128):
+        raise NotImplementedError(
+            f"cuTile group_gemm_fp8_nt_groupwise requires scale_granularity_mnk=(1, 128, 128); "
+            f"got {scale_granularity_mnk}."
+        )
+    if a.dim() != 2:
+        raise ValueError(f"a must be 2D (cum_m, K); got shape {tuple(a.shape)}")
+    if b.dim() != 3:
+        raise ValueError(f"b must be 3D (num_groups, N, K); got shape {tuple(b.shape)}")
+    if a_scale.dim() != 2:
+        raise ValueError(
+            f"a_scale must be 2D; got shape {tuple(a_scale.shape)}"
+        )
+    if b_scale.dim() != 3:
+        raise ValueError(
+            f"b_scale must be 3D; got shape {tuple(b_scale.shape)}"
+        )
+    if m_indptr.dtype != torch.int32:
+        raise ValueError(f"m_indptr must be int32; got {m_indptr.dtype}")
+    num_groups = b.shape[0]
+    if m_indptr.shape != (num_groups + 1,):
+        raise ValueError(
+            f"m_indptr shape mismatch: expected ({num_groups + 1},); "
+            f"got {tuple(m_indptr.shape)}"
+        )
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+
+    # Pull m_indptr to host once so we can index per-group slices without a
+    # GPU->CPU sync per iteration.
+    m_indptr_cpu = m_indptr.cpu().tolist()
+
+    # Per-call zero in ``gemm_fp8_nt_groupwise_cutile`` clobbers the whole
+    # ``out`` view it sees, which is each group's slice — so the upstream
+    # ``out`` doesn't need a global zero here.
+    for g in range(num_groups):
+        m_start = m_indptr_cpu[g]
+        m_end = m_indptr_cpu[g + 1]
+        if m_start == m_end:
+            continue
+        if scale_major_mode == "K":
+            # a_scale: (cum_m, K//block_k) -> slice on dim 0
+            # b_scale: (num_groups, N//block_n, K//block_k) -> select group g
+            a_scale_g = a_scale[m_start:m_end]
+            b_scale_g = b_scale[g]
+        else:
+            # MN-major.
+            # a_scale: (K//block_k, cum_m) -> slice on dim 1
+            # b_scale: (num_groups, K//block_k, N//block_n) -> select group g,
+            #          per-group view stays MN-major (K//block_k, N//block_n).
+            a_scale_g = a_scale[:, m_start:m_end]
+            b_scale_g = b_scale[g]
+        gemm_fp8_nt_groupwise_cutile(
+            a=a[m_start:m_end],
+            b=b[g],
+            a_scale=a_scale_g,
+            b_scale=b_scale_g,
+            out=out[m_start:m_end],
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode,
+        )
     return out

@@ -61,10 +61,10 @@ def test_mm_bf16(
         pytest.skip(
             "mm_bf16 with cuBLASLt backend does not support bias or pdl arguments."
         )
-    if backend == "cutile" and (enable_bias or pdl):
-        pytest.skip(
-            "mm_bf16 with cuTile backend does not support bias or pdl arguments."
-        )
+    # cuTile backend now supports 1-D bf16 bias (pre-broadcast + beta=1.0).
+    # It still does not support `pdl`.
+    if backend == "cutile" and pdl:
+        pytest.skip("mm_bf16 with cuTile backend does not support the pdl argument.")
     if res_dtype != torch.bfloat16 and backend == "tgv":
         pytest.skip(
             "mm_bf16 with TGV backend does not support specifying non-bfloat16 result dtypes."
@@ -100,8 +100,9 @@ def test_mm_bf16(
     assert cos_sim > 0.99
 
 
-def test_mm_bf16_cutile_rejects_bias_and_pdl():
-    """The v1 cuTile path is alpha=1/beta=0 and ignores bias / pdl — must raise.
+def test_mm_bf16_cutile_rejects_bad_bias_and_pdl():
+    """The cuTile path supports 1-D bf16 bias only (pre-broadcast + beta=1) and
+    does not support `pdl` — invalid bias dtype / rank and pdl=True must raise.
 
     Output dtype, on the other hand, supports bf16 / fp16 / fp32 via the
     polymorphic store epilogue, so it is exercised in the main parametrized
@@ -117,10 +118,17 @@ def test_mm_bf16_cutile_rejects_bias_and_pdl():
     # a is (m, k) = (64, 1024); b is (n, k) = (2048, 1024); b.T is (k, n) = (1024, 2048)
     a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
     out = torch.empty(64, 2048, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="ignores `bias`"):
-        mm_bf16(a, b.T, bias, False, out, torch.bfloat16, backend="cutile")
+    # Reject 2-D bias (only 1-D per-output-feature bias is supported).
+    bias_2d = torch.randn(64, 2048, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="1-D per-output-feature bias"):
+        mm_bf16(a, b.T, bias_2d, False, out, torch.bfloat16, backend="cutile")
+    # Reject non-bf16 bias — caught by the common ``_check_mm_bf16_problem_size``
+    # before reaching our backend-specific check, so match the common-check msg.
+    bias_fp32 = torch.randn(2048, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="(?i)bias.*bfloat16"):
+        mm_bf16(a, b.T, bias_fp32, False, out, torch.bfloat16, backend="cutile")
+    # pdl is still rejected.
     with pytest.raises(ValueError, match="ignores `pdl`"):
         mm_bf16(a, b.T, None, True, out, torch.bfloat16, backend="cutile")
 
