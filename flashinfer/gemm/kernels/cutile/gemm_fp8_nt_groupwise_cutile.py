@@ -49,10 +49,15 @@ import torch
 from cuda.tile.tune import exhaustive_search
 
 
-# Module-level tune cache:
+# Module-level tune caches:
 #   key:   (M, N, K, block_n, block_k, output_dtype_int, dtype, str(device))
 #   value: (best_cfg, kernel bound to chosen num_ctas/occupancy)
 _W8A8_TUNE_CACHE: dict = {}
+
+# Fused group-GEMM tune cache:
+#   key:   (G, max_m_per_group, N, K, block_n, block_k, output_dtype_int, dtype, str(device))
+#   value: (best_cfg, kernel bound to chosen num_ctas/occupancy)
+_W8A8_GROUP_FUSED_TUNE_CACHE: dict = {}
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -351,6 +356,280 @@ _DTYPE_INT_MAP = {
     torch.bfloat16: 2,
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fused group-GEMM kernel
+# ─────────────────────────────────────────────────────────────────────────────
+# Ported from Ocean's ragged_block_scaled_bmm.py pattern:
+#   single grid dispatch over all (group, m_tile, n_tile) tuples;
+#   reads m_indptr on-device to determine per-group M slices.
+# Pre-conditions (enforced by caller):
+#   B_flat  : (G * N, K)           — reshape of (G, N, K)
+#   Bs_flat : (G * N//block_n, K//block_k) — reshape of (G, N//block_n, K//block_k)
+
+
+@ct.kernel
+def _w8a8_group_fp8_fused_kernel(
+    # Tensors
+    A,          # (cum_m, K) FP8
+    B,          # (G * N, K) FP8 — pre-reshaped; group g at rows [g*N, (g+1)*N)
+    C,          # (cum_m, N) output — must be zero-initialised before launch
+    As,         # (cum_m, K // block_k) FP32, K-major
+    Bs,         # (G * N // block_n, K // block_k) FP32, K-major — pre-reshaped
+    m_indptr,   # (G + 1,) int32 cumulative segment starts
+    # Dimensions
+    N: ct.Constant[int],
+    K: ct.Constant[int],
+    # Quantisation block sizes (BLOCK_SIZE_N == GROUP_N and BLOCK_SIZE_K == GROUP_K)
+    GROUP_N: ct.Constant[int],
+    GROUP_K: ct.Constant[int],
+    # Strides
+    STRIDE_AM: ct.Constant[int],
+    STRIDE_AK: ct.Constant[int],
+    STRIDE_BN: ct.Constant[int],   # stride of B_flat along dim 0 (= K)
+    STRIDE_BK: ct.Constant[int],   # stride of B_flat along dim 1 (= 1)
+    STRIDE_CM: ct.Constant[int],
+    STRIDE_CN: ct.Constant[int],
+    STRIDE__AS_M: ct.Constant[int],
+    STRIDE__AS_K: ct.Constant[int],
+    STRIDE__BS_N: ct.Constant[int],  # stride of Bs_flat along dim 0 (= K // block_k)
+    STRIDE__BS_K: ct.Constant[int],  # stride of Bs_flat along dim 1 (= 1)
+    # Grid / tile geometry
+    tiles_per_group: ct.Constant[int],   # num_pid_m * num_pid_n
+    num_pid_m: ct.Constant[int],         # cdiv(max_m_per_group, BLOCK_SIZE_M)
+    num_pid_n: ct.Constant[int],         # cdiv(N, BLOCK_SIZE_N)
+    N_per_group: ct.Constant[int],       # N   (offset into B_flat for group g = g * N)
+    Ns_per_group: ct.Constant[int],      # N // block_n (offset into Bs_flat for group g)
+    # Tile sizes / tuning
+    BLOCK_SIZE_M: ct.Constant[int],
+    BLOCK_SIZE_N: ct.Constant[int],
+    BLOCK_SIZE_K: ct.Constant[int],
+    GROUP_SIZE_M: ct.Constant[int],
+    OUTPUT_DTYPE: ct.Constant[int],
+    SWAP_AB: ct.Constant[int],
+):
+    """Fused group-GEMM W8A8 FP8 kernel.
+
+    Dispatches one grid tile per (group, m_tile, n_tile) triple. Each SM:
+    1. Determines its group_id and (pid_m, pid_n) inside that group.
+    2. Reads m_start / m_end from m_indptr on-device (one ct.gather per value).
+    3. Skips if pid_m * BLOCK_SIZE_M >= (m_end - m_start).
+    4. Computes A[m_start + pid_m*BM : , :] @ B[g*N + pid_n*BN : , :]^T scaled.
+    5. Masks invalid rows (last partial M tile) to zero before scatter.
+
+    C must be zeroed before launch — the masked scatter writes 0 for invalid
+    rows and the next group's tiles will fill their own rows later.
+
+    Reference: Ocean ragged_block_scaled_bmm.py.
+    """
+    ct.static_assert(
+        BLOCK_SIZE_N == GROUP_N,
+        f"Kernel requires BLOCK_SIZE_N == GROUP_N",
+    )
+    ct.static_assert(
+        BLOCK_SIZE_K == GROUP_K,
+        f"Kernel requires BLOCK_SIZE_K == GROUP_K",
+    )
+
+    pid = ct.bid(0)
+    group_id = pid // tiles_per_group
+    pid_in_group = pid % tiles_per_group
+
+    # GROUP_SIZE_M tile swizzle within the group
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    swizzle_group = pid_in_group // num_pid_in_group
+    first_pid_m = swizzle_group * GROUP_SIZE_M
+    group_size_m_actual = ct.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid_in_group % group_size_m_actual)
+    pid_n = (pid_in_group % num_pid_in_group) // group_size_m_actual
+
+    # Load segment boundaries from m_indptr on-device.
+    m_start_t = ct.gather(m_indptr, (group_id,))
+    m_end_t = ct.gather(m_indptr, (group_id + 1,))
+    m_start = m_start_t.item()
+    m_end = m_end_t.item()
+    valid_m = m_end - m_start
+
+    if pid_m * BLOCK_SIZE_M < valid_m:
+        # Row indices for A and C (absolute within cum_m)
+        offs_am = m_start + pid_m * BLOCK_SIZE_M + ct.arange(BLOCK_SIZE_M, dtype=ct.int32)
+        # Row indices for B_flat (group offset + tile offset within N)
+        offs_bn = group_id * N_per_group + pid_n * BLOCK_SIZE_N + ct.arange(BLOCK_SIZE_N, dtype=ct.int32)
+        offs_k_base = ct.arange(BLOCK_SIZE_K, dtype=ct.int32)
+
+        accumulator = ct.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=ct.float32)
+
+        num_k_tiles = ct.cdiv(K, BLOCK_SIZE_K)
+        for k_tile in range(num_k_tiles):
+            k_start = k_tile * BLOCK_SIZE_K
+            offs_k = offs_k_base + k_start
+
+            # Load A block: (BLOCK_SIZE_M, BLOCK_SIZE_K)
+            a_blk = ct.gather(
+                A,
+                (offs_am[:, None], offs_k[None, :]),
+                check_bounds=True,
+                padding_value=ct.float8_e4m3fn(0.0),
+            )
+
+            # Load B block from B_flat: (BLOCK_SIZE_N, BLOCK_SIZE_K)
+            b_blk = ct.gather(
+                B,
+                (offs_bn[:, None], offs_k[None, :]),
+                check_bounds=True,
+                padding_value=ct.float8_e4m3fn(0.0),
+            )
+
+            # Load A scale: (BLOCK_SIZE_M,) — one scale per M row per K-tile
+            a_s = ct.gather(As, (offs_am, k_tile), check_bounds=True, padding_value=0.0)
+
+            # Load B scale from Bs_flat: scalar — one scale per (N-tile, K-tile)
+            bs_row_idx = group_id * Ns_per_group + pid_n
+            b_s = ct.gather(Bs, (bs_row_idx, k_tile), check_bounds=True, padding_value=0.0)
+            ab_s = a_s[:, None] * b_s
+
+            # MMA (with optional operand swap for autotuner exploration)
+            if SWAP_AB:
+                zero_acc = ct.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=ct.float32)
+                a_t = ct.permute(a_blk, (1, 0))
+                dot_result = ct.mma(b_blk, a_t, acc=zero_acc)
+                dot_result = ct.permute(dot_result, (1, 0))
+            else:
+                zero_acc = ct.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=ct.float32)
+                b_t = ct.permute(b_blk, (1, 0))
+                dot_result = ct.mma(a_blk, b_t, acc=zero_acc)
+
+            accumulator = accumulator + dot_result * ab_s
+
+        # Cast accumulator to output dtype
+        if OUTPUT_DTYPE == 0:
+            c = accumulator
+        elif OUTPUT_DTYPE == 1:
+            c = ct.astype(accumulator, ct.float16)
+        elif OUTPUT_DTYPE == 2:
+            c = ct.astype(accumulator, ct.bfloat16)
+        else:
+            c = accumulator
+
+        # Mask rows that fall beyond m_end (last partial M tile of this group)
+        # so the scatter does not overwrite the next group's rows with garbage.
+        # C was zero-init before launch, and the next group's tiles will fill
+        # their own rows; writing 0 here is safe.
+        row_valid = offs_am < m_end
+        c_masked = ct.where(row_valid[:, None], c, ct.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c.dtype))
+
+        offs_cm = offs_am
+        offs_cn = pid_n * BLOCK_SIZE_N + ct.arange(BLOCK_SIZE_N, dtype=ct.int32)
+        ct.scatter(C, (offs_cm[:, None], offs_cn[None, :]), c_masked, check_bounds=True)
+
+
+def _w8a8_group_fused_autotune_configs(block_n_quant, block_k_quant):
+    """Yield autotune configs for the fused group-GEMM kernel."""
+    for block_m in [16, 32, 64, 128]:
+        for occupancy in [1, 2, 4]:
+            for swap_ab in [True, False]:
+                yield SimpleNamespace(
+                    BLOCK_SIZE_M=block_m,
+                    BLOCK_SIZE_N=block_n_quant,
+                    BLOCK_SIZE_K=block_k_quant,
+                    GROUP_SIZE_M=16,
+                    num_ctas=1,
+                    occupancy=occupancy,
+                    swap_ab=swap_ab,
+                )
+
+
+def _w8a8_group_fused_autotune_and_launch(
+    stream,
+    A, B_flat, C, As, Bs_flat, m_indptr,
+    G, max_m_per_group, N, K,
+    block_n, block_k,
+    output_dtype_int,
+):
+    """Launch the fused group-GEMM kernel with exhaustive_search autotuning."""
+    cache_key = (
+        G, max_m_per_group, N, K, block_n, block_k, output_dtype_int,
+        A.dtype, str(A.device),
+    )
+
+    if cache_key not in _W8A8_GROUP_FUSED_TUNE_CACHE:
+        configs = [
+            cfg for cfg in _w8a8_group_fused_autotune_configs(block_n, block_k)
+            if cfg.BLOCK_SIZE_M <= max_m_per_group
+        ] or list(_w8a8_group_fused_autotune_configs(block_n, block_k))[:1]
+
+        num_pid_n = _cdiv(N, block_n)
+        N_per_group = N
+        Ns_per_group = _cdiv(N, block_n)
+
+        def grid_fn(cfg):
+            npm = _cdiv(max_m_per_group, cfg.BLOCK_SIZE_M)
+            tiles_pg = npm * num_pid_n
+            return (G * tiles_pg, 1, 1)
+
+        def args_fn(cfg):
+            npm = _cdiv(max_m_per_group, cfg.BLOCK_SIZE_M)
+            tiles_pg = npm * num_pid_n
+            return (
+                A, B_flat, C, As, Bs_flat, m_indptr,
+                N, K,
+                block_n, block_k,
+                A.stride(0), A.stride(1),
+                B_flat.stride(0), B_flat.stride(1),
+                C.stride(0), C.stride(1),
+                As.stride(0), As.stride(1),
+                Bs_flat.stride(0), Bs_flat.stride(1),
+                tiles_pg, npm, num_pid_n,
+                N_per_group, Ns_per_group,
+                cfg.BLOCK_SIZE_M, cfg.BLOCK_SIZE_N, cfg.BLOCK_SIZE_K,
+                cfg.GROUP_SIZE_M,
+                output_dtype_int,
+                int(cfg.swap_ab),
+            )
+
+        def hints_fn(cfg):
+            return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
+
+        result = exhaustive_search(
+            configs, stream, grid_fn,
+            _w8a8_group_fp8_fused_kernel,
+            args_fn, hints_fn,
+        )
+        best_cfg = result.best.config
+        tuned_kernel = ct.kernel(
+            _w8a8_group_fp8_fused_kernel._pyfunc,
+            num_ctas=best_cfg.num_ctas,
+            occupancy=best_cfg.occupancy,
+        )
+        _W8A8_GROUP_FUSED_TUNE_CACHE[cache_key] = (best_cfg, tuned_kernel)
+
+    best_cfg, tuned_kernel = _W8A8_GROUP_FUSED_TUNE_CACHE[cache_key]
+    num_pid_n = _cdiv(N, block_n)
+    npm = _cdiv(max_m_per_group, best_cfg.BLOCK_SIZE_M)
+    tiles_pg = npm * num_pid_n
+    N_per_group = N
+    Ns_per_group = _cdiv(N, block_n)
+    ct.launch(
+        stream,
+        (G * tiles_pg, 1, 1),
+        tuned_kernel,
+        (
+            A, B_flat, C, As, Bs_flat, m_indptr,
+            N, K,
+            block_n, block_k,
+            A.stride(0), A.stride(1),
+            B_flat.stride(0), B_flat.stride(1),
+            C.stride(0), C.stride(1),
+            As.stride(0), As.stride(1),
+            Bs_flat.stride(0), Bs_flat.stride(1),
+            tiles_pg, npm, num_pid_n,
+            N_per_group, Ns_per_group,
+            best_cfg.BLOCK_SIZE_M, best_cfg.BLOCK_SIZE_N, best_cfg.BLOCK_SIZE_K,
+            best_cfg.GROUP_SIZE_M,
+            output_dtype_int,
+            int(best_cfg.swap_ab),
+        ),
+    )
+
 
 def gemm_fp8_nt_groupwise_cutile(
     a: torch.Tensor,
@@ -507,11 +786,16 @@ def group_gemm_fp8_nt_groupwise_cutile(
     M axis. Used heavily in MoE workloads where each expert is a different
     group.
 
-    The v1 implementation iterates over groups and calls
-    ``gemm_fp8_nt_groupwise_cutile`` once per group. This launches one kernel
-    per non-empty group — fine as a correctness baseline. A fused-launch
-    optimization (single autotuned kernel that consumes ``m_indptr`` directly,
-    mirroring the way the ragged BMM kernel does it) is a follow-up.
+    Implemented as a *fused single-kernel* dispatch: one CUDA grid covers all
+    ``(group, m_tile, n_tile)`` tuples.  Each thread block reads its group's
+    ``m_indptr`` boundaries on-device, computes its FP8 MMA tile, masks partial
+    M tiles, and scatters the result to the correct rows of ``C``.  This avoids
+    the per-group kernel launch overhead of the earlier loop-based baseline and
+    enables the autotuner to optimise across groups jointly.
+
+    Design follows the Ocean ``ragged_block_scaled_bmm.py`` persistent-scheduler
+    pattern.  ``B`` and ``Bs`` are pre-flattened to ``(G*N, K)`` and
+    ``(G*N//block_n, K//block_k)`` before launch.
 
     Parameters
     ----------
@@ -566,37 +850,73 @@ def group_gemm_fp8_nt_groupwise_cutile(
     if not out.is_contiguous():
         raise ValueError("out must be contiguous")
 
-    # Pull m_indptr to host once so we can index per-group slices without a
-    # GPU->CPU sync per iteration.
-    m_indptr_cpu = m_indptr.cpu().tolist()
-
-    # Per-call zero in ``gemm_fp8_nt_groupwise_cutile`` clobbers the whole
-    # ``out`` view it sees, which is each group's slice — so the upstream
-    # ``out`` doesn't need a global zero here.
-    for g in range(num_groups):
-        m_start = m_indptr_cpu[g]
-        m_end = m_indptr_cpu[g + 1]
-        if m_start == m_end:
-            continue
-        if scale_major_mode == "K":
-            # a_scale: (cum_m, K//block_k) -> slice on dim 0
-            # b_scale: (num_groups, N//block_n, K//block_k) -> select group g
-            a_scale_g = a_scale[m_start:m_end]
-            b_scale_g = b_scale[g]
-        else:
-            # MN-major.
-            # a_scale: (K//block_k, cum_m) -> slice on dim 1
-            # b_scale: (num_groups, K//block_k, N//block_n) -> select group g,
-            #          per-group view stays MN-major (K//block_k, N//block_n).
-            a_scale_g = a_scale[:, m_start:m_end]
-            b_scale_g = b_scale[g]
-        gemm_fp8_nt_groupwise_cutile(
-            a=a[m_start:m_end],
-            b=b[g],
-            a_scale=a_scale_g,
-            b_scale=b_scale_g,
-            out=out[m_start:m_end],
-            scale_granularity_mnk=scale_granularity_mnk,
-            scale_major_mode=scale_major_mode,
+    out_dtype_int = _DTYPE_INT_MAP.get(out.dtype)
+    if out_dtype_int is None:
+        raise ValueError(
+            f"out.dtype {out.dtype} not supported by cuTile group_gemm_fp8_nt_groupwise; "
+            f"expected bf16 / fp16 / fp32"
         )
+
+    G = num_groups
+    _cum_m, K = a.shape
+    N = b.shape[1]
+    block_n, block_k = n_g, k_g
+
+    # Pull m_indptr to host once to compute max_m_per_group (needed for grid
+    # sizing) without per-tile GPU->CPU syncs later.
+    m_indptr_cpu = m_indptr.cpu().tolist()
+    max_m_per_group = max(
+        (m_indptr_cpu[g + 1] - m_indptr_cpu[g] for g in range(G)),
+        default=0,
+    )
+    if max_m_per_group == 0:
+        # All groups are empty — nothing to compute.
+        return out
+
+    # Flatten B and Bs along the group axis so the fused kernel can index them
+    # with a single linear row index (group_id * N + pid_n * BN + ...).
+    #
+    # K-major layout (the kernel's native layout):
+    #   a_scale : (cum_m, K//block_k)
+    #   b_scale : (G, N//block_n, K//block_k) → reshape to (G*N//block_n, K//block_k)
+    #
+    # MN-major layout: the incoming tensors have the M and K axes swapped
+    # relative to K-major.  We expose K-major *views* to the kernel:
+    #   a_scale : (K//block_k, cum_m) → transpose to (cum_m, K//block_k)
+    #             The kernel reads via STRIDE__AS_M / STRIDE__AS_K, so the
+    #             non-contiguous transposed strides are handled correctly.
+    #   b_scale : (G, K//block_k, N//block_n) → permute axes 1↔2 to get
+    #             (G, N//block_n, K//block_k), make contiguous, then reshape.
+    #             A contiguous copy is unavoidable here because the permuted
+    #             view cannot be reshaped without copying.
+    B_flat = b.reshape(G * N, K)  # b is (G, N, K) contiguous → safe to reshape
+
+    if scale_major_mode == "K":
+        a_scale_k = a_scale  # (cum_m, K//block_k) already K-major
+        Bs_flat = b_scale.reshape(
+            G * _cdiv(N, block_n), _cdiv(K, block_k)
+        )  # (G, N//bn, K//bk) contiguous → safe
+    else:  # MN-major
+        # Transpose a_scale view (no copy; kernel strides handle the layout).
+        a_scale_k = a_scale.transpose(0, 1)  # (cum_m, K//block_k) non-contiguous
+        # Permute b_scale (G, K//bk, N//bn) → (G, N//bn, K//bk) then flatten.
+        Bs_flat = (
+            b_scale.permute(0, 2, 1)
+            .contiguous()  # makes (G, N//bn, K//bk) contiguous
+            .reshape(G * _cdiv(N, block_n), _cdiv(K, block_k))
+        )
+
+    # Zero output once before the fused launch.  Individual rows of C that
+    # belong to a valid group tile are overwritten by the kernel; rows beyond
+    # m_end for each group are zeroed by the ct.where mask inside the kernel,
+    # so a global zero-init here ensures no stale garbage escapes.
+    out.zero_()
+
+    _w8a8_group_fused_autotune_and_launch(
+        torch.cuda.current_stream(a.device),
+        a, B_flat, out, a_scale_k, Bs_flat, m_indptr,
+        G, max_m_per_group, N, K,
+        block_n, block_k,
+        out_dtype_int,
+    )
     return out

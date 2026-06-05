@@ -62,11 +62,23 @@ import cuda.tile as ct
 import torch
 from cuda.tile.tune import exhaustive_search
 
+# TODO(https://jirasw.nvidia.com/browse/CFK-35001): Drop this monkey-patch once
+# cuda.tile officially exports mma_scaled. Guarded so we don't clobber a real
+# upstream export if/when it lands. Same pattern as Ocean's gemm_block_scale.py.
+try:
+    from cuda.tile._stub import mma_scaled as _mma_scaled
+    if not hasattr(ct, "mma_scaled"):
+        ct.mma_scaled = _mma_scaled
+    _MMA_SCALED_AVAILABLE = True
+except Exception:
+    _MMA_SCALED_AVAILABLE = False
 
-# Module-level tune cache:
-#   key:   (M, N, K, transpose_a_int, transpose_b_int, a_dtype, str(device))
+
+# Module-level tune caches:
+#   key:   (M, N, K, a_dtype, str(device))
 #   value: (best_cfg, kernel bound to chosen num_ctas/occupancy)
 _FP4_MANUAL_TUNE_CACHE: dict = {}
+_FP4_MMA_SCALED_TUNE_CACHE: dict = {}
 
 # NVFP4 quantization vector size (one FP8 scale per 16 FP4 elements along K)
 _NVFP4_VEC_SIZE = 16
@@ -198,6 +210,198 @@ def _bs_gemm_fp4_manual_kernel_cutile(
             tile=c_block,
             order=(0, 1),
         )
+
+
+@ct.kernel
+def _bs_gemm_fp4_mma_scaled_kernel_cutile(
+    a_ptr,          # (M, K//2) uint8 packed FP4
+    b_ptr,          # (N, K//2) uint8 packed FP4 (NT layout)
+    c_ptr,          # (M, N) output
+    a_scale_ptr,    # (M, K//VEC_SIZE) float8_e4m3fn
+    b_scale_ptr,    # (N, K//VEC_SIZE) float8_e4m3fn
+    M: ct.Constant[int],
+    N: ct.Constant[int],
+    num_k_tiles: ct.Constant[int],
+    num_pid_m: ct.Constant[int],
+    num_pid_n: ct.Constant[int],
+    total_tiles: ct.Constant[int],
+    num_programs: ct.Constant[int],
+    VEC_SIZE: ct.Constant[int],
+    SCALES_PER_BLOCK_K: ct.Constant[int],  # BLOCK_K // VEC_SIZE
+    BLOCK_M: ct.Constant[int],
+    BLOCK_N: ct.Constant[int],
+    BLOCK_K: ct.Constant[int],
+    GROUP_SIZE_M: ct.Constant[int],
+):
+    """NVFP4 GEMM using ct.mma_scaled hardware-accelerated scaled MMA.
+
+    Replaces the manual fp32-upcast + broadcast + ct.mma inner loop with a
+    single ct.mma_scaled call per K-tile. Scale tiles are 2D:
+      a_scale: (BLOCK_M, BLOCK_K // VEC_SIZE) float8_e4m3fn — "M × K_scale"
+      b_scale: (BLOCK_K // VEC_SIZE, BLOCK_N) float8_e4m3fn — "K_scale × N"
+
+    Reference: Ocean gemm_block_scale.py (bs_gemm_scaled_kernel_cutile).
+    """
+    pid = ct.bid(0)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    zero_pad = ct.PaddingMode.ZERO
+
+    for current_pid in range(pid, total_tiles, num_programs):
+        group_id = current_pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m_actual = ct.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (current_pid % group_size_m_actual)
+        pid_n = (current_pid % num_pid_in_group) // group_size_m_actual
+
+        acc = ct.full((BLOCK_M, BLOCK_N), 0.0, dtype=ct.float32)
+
+        for k in range(num_k_tiles):
+            # ── Load A tile: (BLOCK_M, BLOCK_K//2) uint8 → unpack → (BLOCK_M, BLOCK_K) fp4 ──
+            a_bytes = ct.load(
+                a_ptr,
+                index=(pid_m * BLOCK_M, k * (BLOCK_K // 2)),
+                shape=(BLOCK_M, BLOCK_K // 2),
+                order=(0, 1),
+                padding_mode=zero_pad,
+            )
+            a_flat = ct.reshape(a_bytes, (-1,))
+            a_unp = ct.unpack_from_bytes(a_flat, ct.float4_e2m1fn)
+            a_block = ct.reshape(a_unp, (BLOCK_M, BLOCK_K))
+
+            # ── Load B tile: (BLOCK_N, BLOCK_K//2) uint8 → unpack → permute → (BLOCK_K, BLOCK_N) ──
+            b_bytes = ct.load(
+                b_ptr,
+                index=(pid_n * BLOCK_N, k * (BLOCK_K // 2)),
+                shape=(BLOCK_N, BLOCK_K // 2),
+                order=(0, 1),
+                padding_mode=zero_pad,
+            )
+            b_flat = ct.reshape(b_bytes, (-1,))
+            b_unp = ct.unpack_from_bytes(b_flat, ct.float4_e2m1fn)
+            b_nk = ct.reshape(b_unp, (BLOCK_N, BLOCK_K))
+            b_block = ct.permute(b_nk, (1, 0))  # [BLOCK_K, BLOCK_N]
+
+            # ── Load A scale: (BLOCK_M, SCALES_PER_BLOCK_K) fp8 ──
+            a_scale_block = ct.load(
+                a_scale_ptr,
+                index=(pid_m * BLOCK_M, k * SCALES_PER_BLOCK_K),
+                shape=(BLOCK_M, SCALES_PER_BLOCK_K),
+                order=(0, 1),
+                padding_mode=zero_pad,
+            )
+
+            # ── Load B scale: (BLOCK_N, SCALES_PER_BLOCK_K) fp8 → permute → (SCALES_PER_BLOCK_K, BLOCK_N) ──
+            b_scale_nk = ct.load(
+                b_scale_ptr,
+                index=(pid_n * BLOCK_N, k * SCALES_PER_BLOCK_K),
+                shape=(BLOCK_N, SCALES_PER_BLOCK_K),
+                order=(0, 1),
+                padding_mode=zero_pad,
+            )
+            b_scale_block = ct.permute(b_scale_nk, (1, 0))  # [SCALES_PER_BLOCK_K, BLOCK_N]
+
+            # ── Hardware-accelerated scaled MMA ──
+            acc = ct.mma_scaled(a_block, a_scale_block, b_block, b_scale_block, acc)
+
+        c_block = ct.astype(acc, c_ptr.dtype)
+        ct.store(
+            c_ptr,
+            index=(pid_m * BLOCK_M, pid_n * BLOCK_N),
+            tile=c_block,
+            order=(0, 1),
+        )
+
+
+def _bs_gemm_fp4_mma_scaled_autotune_configs():
+    """Autotune configs for the mma_scaled kernel.
+
+    Supports larger tiles than the manual kernel (lower register pressure
+    since scale application is handled by hardware). Aligned with Ocean's
+    _bs_gemm_autotune_configs() in gemm_block_scale.py.
+    """
+    gpu_capability = torch.cuda.get_device_capability()
+
+    if gpu_capability[0] >= 10:
+        # Blackwell family (sm_100/103/120/121)
+        for BM, BN, nc, occ, gsm in [
+            (128, 128, 1, 1, 8),
+            (128, 128, 1, 2, 8),
+            (128, 256, 1, 1, 8),
+            (128, 256, 1, 2, 8),
+            (256, 128, 2, 1, 8),
+            (256, 256, 2, 1, 8),
+            (128, 128, 1, 4, 1),
+            (128, 256, 1, 2, 1),
+        ]:
+            yield SimpleNamespace(
+                BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=128,
+                GROUP_SIZE_M=gsm, num_ctas=nc, occupancy=occ,
+            )
+    else:
+        for BM, BN in [(128, 128), (128, 256)]:
+            for occ in [1, 2]:
+                yield SimpleNamespace(
+                    BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=128,
+                    GROUP_SIZE_M=8, num_ctas=1, occupancy=occ,
+                )
+
+
+def _bs_gemm_fp4_mma_scaled_autotune_and_launch(stream, A, B, C, As, Bs, M, N, K, VEC_SIZE):
+    """Launch FP4 mma_scaled kernel with exhaustive_search autotuning."""
+    cache_key = (M, N, K, A.dtype, str(A.device))
+
+    if cache_key not in _FP4_MMA_SCALED_TUNE_CACHE:
+        configs = list(_bs_gemm_fp4_mma_scaled_autotune_configs())
+
+        def grid_fn(cfg):
+            return (_cdiv(M, cfg.BLOCK_M) * _cdiv(N, cfg.BLOCK_N), 1, 1)
+
+        def args_fn(cfg):
+            BM, BN, BK = cfg.BLOCK_M, cfg.BLOCK_N, cfg.BLOCK_K
+            num_pid_m = _cdiv(M, BM)
+            num_pid_n = _cdiv(N, BN)
+            num_k_tiles = _cdiv(K, BK)
+            total_tiles = num_pid_m * num_pid_n
+            return (
+                A, B, C, As, Bs,
+                M, N, num_k_tiles, num_pid_m, num_pid_n,
+                total_tiles, total_tiles,
+                VEC_SIZE, BK // VEC_SIZE,
+                BM, BN, BK, cfg.GROUP_SIZE_M,
+            )
+
+        result = exhaustive_search(
+            configs, stream, grid_fn,
+            _bs_gemm_fp4_mma_scaled_kernel_cutile,
+            args_fn,
+            lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+        )
+        best_cfg = result.best.config
+        tuned_kernel = ct.kernel(
+            _bs_gemm_fp4_mma_scaled_kernel_cutile._pyfunc,
+            num_ctas=best_cfg.num_ctas,
+            occupancy=best_cfg.occupancy,
+        )
+        _FP4_MMA_SCALED_TUNE_CACHE[cache_key] = (best_cfg, tuned_kernel)
+
+    best_cfg, tuned_kernel = _FP4_MMA_SCALED_TUNE_CACHE[cache_key]
+    BM, BN, BK = best_cfg.BLOCK_M, best_cfg.BLOCK_N, best_cfg.BLOCK_K
+    num_pid_m = _cdiv(M, BM)
+    num_pid_n = _cdiv(N, BN)
+    num_k_tiles = _cdiv(K, BK)
+    total_tiles = num_pid_m * num_pid_n
+    ct.launch(
+        stream,
+        (total_tiles, 1, 1),
+        tuned_kernel,
+        (
+            A, B, C, As, Bs,
+            M, N, num_k_tiles, num_pid_m, num_pid_n,
+            total_tiles, total_tiles,
+            VEC_SIZE, BK // VEC_SIZE,
+            BM, BN, BK, best_cfg.GROUP_SIZE_M,
+        ),
+    )
 
 
 def _bs_gemm_fp4_manual_autotune_configs():
@@ -430,11 +634,23 @@ def mm_fp4_cutile(
             f"got {tuple(b_scale_view.shape)}"
         )
 
-    _bs_gemm_fp4_autotune_and_launch(
-        torch.cuda.current_stream(),
-        a, b_nk, out, a_scale_view, b_scale_view,
-        M, N, K, _NVFP4_VEC_SIZE,
-    )
+    stream = torch.cuda.current_stream()
+    if _MMA_SCALED_AVAILABLE:
+        # Fast-path: hardware-accelerated scaled MMA (ct.mma_scaled).
+        # Lower register pressure → supports larger tiles → better perf.
+        # Reference: Ocean gemm_block_scale.py (bs_gemm_scaled_kernel_cutile).
+        _bs_gemm_fp4_mma_scaled_autotune_and_launch(
+            stream,
+            a, b_nk, out, a_scale_view, b_scale_view,
+            M, N, K, _NVFP4_VEC_SIZE,
+        )
+    else:
+        # Fallback: manual fp32-upcast + scale broadcast + ct.mma.
+        _bs_gemm_fp4_autotune_and_launch(
+            stream,
+            a, b_nk, out, a_scale_view, b_scale_view,
+            M, N, K, _NVFP4_VEC_SIZE,
+        )
 
     # Apply the optional global alpha scale post-MMA.
     if alpha is not None:
